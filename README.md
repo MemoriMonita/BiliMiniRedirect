@@ -49,15 +49,42 @@ hook 点选公开的 `startActivity` / `checkAndDoSync`（签名稳定），不�
 
 重定向时保留原始 `data` URI，所以能直达对应视频（PiliPlus 的 Manifest 声明了 `bilibili://video`、`bilibili://bangumi/season*`、`https://*.bilibili.com` 等）。
 
+### 只在小程序进程里 hook（重要）
+
+QQ 的风控（腾讯 TuringFD + `minidetect.so`）在**主进程**里扫 `/proc/self/maps`、`/proc/self/status`、`/proc/self/mountinfo` 找注入痕迹，主进程被注入就有被踢下线的风险。
+
+而小程序跳转发生在 `:mini` 系列进程，主进程根本不需要 hook。所以模块按**进程名白名单**决定是否注入：
+
+| 进程 | 是否 hook |
+|---|---|
+| `com.tencent.mobileqq`（主进程） | ❌ 只打日志，不挂任何 hook |
+| `:MSF` / `:tool` / `:qzone` / `:peak` / `:privileged_process1` / `:gameservice` | ❌ 同上 |
+| `:mini` / `:mini1` / `:mini2` / `:mini3` | ✅ 注入 |
+| `com.tencent.mm:appbrand*`（微信小程序） | ✅ 注入 |
+
+实测主进程的 `/proc/self/maps` 里**看不到模块 APK 路径**（LSPosed 是内存加载 dex，不是 mmap 文件），所以 TuringFD 的 maps 扫描扫不到。
+
+> ⚠ LSPosed 的作用域是**按应用**勾选的，没有「按进程排除」功能。
+> 所以 QQ 的作用域**必须保持勾选**，靠模块自己的进程白名单来避免污染主进程。
+> 如果取消勾选 QQ，模块根本不会被加载，功能直接失效。
+
 ### 实测
 
 小米 25060RK16C / HyperOS 3.0 / Android 16，QQ 小程序里点视频，LSPosed 日志：
 
 ```
+# 主进程：只跳过，不 hook
+(com.tencent.mobileqq)      BiliRedirect: 跳过 com.tencent.mobileqq（非小程序进程，不注入 hook）
+(com.tencent.mobileqq)      BiliRedirect: [自检] maps 里的模块痕迹 = 无（干净）
+
+# 小程序进程：正常注入
+(com.tencent.mobileqq:mini) BiliRedirect: 注入 ... hook JefsClass#checkAndDoSync(3 参) OK
+
+# 拦截生效
 (com.tencent.mobileqq:mini) BiliRedirect [Jefs.checkAndDoSync]
-  pkg=tv.danmaku.bili  data=bilibili://video/BV17Ss86mEyj?page=0&bsource=xcx&h5awaken=...
+  pkg=tv.danmaku.bili  data=bilibili://video/BV1iSYs6SE4G?page=0&bsource=xcx&...
   =>  pkg=com.example.piliplus  comp=com.example.piliplus/.MainActivity
-      data=bilibili://video/BV17Ss86mEyj?page=0&bsource=xcx&h5awaken=...
+      data=bilibili://video/BV1iSYs6SE4G?page=0&bsource=xcx&...
 ```
 
 PiliPlus 直接在前台打开，没有弹「即将离开QQ」确认框，BV 号与全部参数原样保留。
@@ -93,13 +120,16 @@ PiliPlus 直接在前台打开，没有弹「即将离开QQ」确认框，BV 号
 打开「日志取证」，复现一次跳转，去 **LSPosed 管理器 → 日志** 看 `BiliRedirect` 标签：
 
 ```
+BiliRedirect: 跳过 com.tencent.mobileqq / com.tencent.mobileqq（非小程序进程，不注入 hook）
+BiliRedirect: [自检] com.tencent.mobileqq maps 里的模块痕迹 = 无（干净）
 BiliRedirect: 注入 com.tencent.mobileqq / com.tencent.mobileqq:mini
 BiliRedirect: hook JefsClass#startActivity(2 参) OK
 BiliRedirect: hook JefsClass#checkAndDoSync(3 参) OK
 BiliRedirect [Jefs.checkAndDoSync] pkg=tv.danmaku.bili ...  =>  pkg=com.example.piliplus ...
 ```
 
-- **一条都没有** → 作用域没勾上，或 QQ 没重启
+- **一条都没有** → 作用域没勾上（QQ 必须勾），或 QQ 没重启
+- **只有「跳过」没有「注入」** → 正常，说明你还没打开小程序；`:mini` 进程要打开小程序才会创建
 - **只有「全部」没有「=>」** → `shouldRedirect` 没命中，把日志发 issue
 - **有「=>」但没跳过去** → 看有没有 `自行跳转失败`
 
@@ -110,6 +140,7 @@ BiliRedirect [Jefs.checkAndDoSync] pkg=tv.danmaku.bili ...  =>  pkg=com.example.
 - QQ 版本更新后 `JefsClass` 可能改名/改签名 → 日志会打「JefsClass 里没找到可 hook 的方法，退回通用 hook」，此时靠第 3/4 层兜底（但会保留 QQ 的确认弹窗）
 - HyperOS 的「链式启动管理」（`com.miui.securitycenter`）可能在系统层再弹一次确认，本模块不处理
 - 只接管 B 站系包名：`tv.danmaku.bili` / `tv.danmaku.bilibilihd` / `com.bilibili.app.in` / `com.bilibili.bilithings` / `com.bilibili.app.blue`
+- **主进程仍会被 LSPosed 加载模块**（只是不挂 hook）。maps 里看不到痕迹，但 LSPosed 注入本身在 ART 层有残留，理论上仍可能被更强的检测发现。如果还是被踢，需要改成 hook `system_server`（`ActivityStarter.executeRequest`），让 QQ 进程一个模块都不注入
 
 ---
 
