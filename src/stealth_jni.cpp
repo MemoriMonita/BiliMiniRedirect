@@ -124,23 +124,32 @@ int find_lib_cb(struct dl_phdr_info *info, size_t /*size*/, void *data) {
 }
 
 void wait_and_hook() {
-    constexpr int kMaxPolls = 1500;  // 1500 * 20ms = 30 秒
-    int lastLogged = -1;
+    // 不设超时：libfekit.so 可能在进程启动后很久才加载（实测 :tool 进程 20 秒后仍在等）。
+    // 之前设 30 秒超时会直接放弃，导致某些进程永远没 hook 上 —— 这是被踢的主因之一。
+    //
+    // 用 200ms 间隔长期轮询，CPU 开销可忽略（dl_iterate_phdr 只是遍历已加载库表）。
+    constexpr int kIntervalMs = 200;
+    long polls = 0;
+    int lastLoggedMinute = -1;
 
-    for (int i = 0; i < kMaxPolls; ++i) {
+    for (;;) {
         bool ok = false;
         dl_iterate_phdr(find_lib_cb, &ok);
         if (ok) {
-            LOGI("PLT hook installed for %s (poll #%d)", g_lib_name.c_str(), i);
+            LOGI("PLT hook installed for %s (poll #%ld, elapsed %ldms)",
+                 g_lib_name.c_str(), polls, polls * kIntervalMs);
             return;
         }
-        if (i - lastLogged >= 250) {
-            LOGI("still waiting for %s ... (poll #%d)", g_lib_name.c_str(), i);
-            lastLogged = i;
+        // 每 30 秒提示一次还在等
+        long minute = (polls * kIntervalMs) / 30000;
+        if (minute != lastLoggedMinute) {
+            LOGI("still waiting for %s ... (%lds)", g_lib_name.c_str(),
+                 (polls * kIntervalMs) / 1000);
+            lastLoggedMinute = static_cast<int>(minute);
         }
-        usleep(20 * 1000);
+        usleep(kIntervalMs * 1000);
+        ++polls;
     }
-    LOGE("%s not found / no fopen PLT slot within timeout", g_lib_name.c_str());
 }
 
 std::string jstr(JNIEnv *env, jstring s) {
