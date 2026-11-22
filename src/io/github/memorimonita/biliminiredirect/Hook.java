@@ -1,4 +1,4 @@
-package com.cx.biliredirect;
+package io.github.memorimonita.biliminiredirect;
 
 import android.content.ComponentName;
 import android.content.Context;
@@ -34,7 +34,7 @@ import de.robv.android.xposed.callbacks.XC_LoadPackage.LoadPackageParam;
 public class Hook implements IXposedHookLoadPackage {
 
     private static final String TAG = "BiliRedirect";
-    private static final String MODULE_PKG = "com.cx.biliredirect";
+    private static final String MODULE_PKG = "io.github.memorimonita.biliminiredirect";
     private static final String PREF_NAME = "config";
     private static final String DEFAULT_TARGET = "com.example.piliplus";
 

@@ -101,7 +101,7 @@ std::string jstr(JNIEnv *env, jstring s) {
 }  // namespace
 
 extern "C" JNIEXPORT void JNICALL
-Java_com_cx_biliredirect_Stealth_nativeStart(JNIEnv *env, jclass /*clazz*/,
+Java_io_github_memorimonita_biliminiredirect_Stealth_nativeStart(JNIEnv *env, jclass /*clazz*/,
                                              jstring libName, jstring blockPath) {
     if (g_orig_fopen != nullptr) return;  // 已经启动过
     g_lib_name = jstr(env, libName);

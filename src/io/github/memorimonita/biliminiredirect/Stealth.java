@@ -1,4 +1,4 @@
-package com.cx.biliredirect;
+package io.github.memorimonita.biliminiredirect;
 
 import android.app.Application;
 import android.content.Context;
@@ -19,7 +19,7 @@ import de.robv.android.xposed.XposedBridge;
 public final class Stealth {
 
     private static final String TAG = "BiliRedirect";
-    private static final String MODULE_PKG = "com.cx.biliredirect";
+    private static final String MODULE_PKG = "io.github.memorimonita.biliminiredirect";
     private static final String SO_NAME = "libstealth.so";
     private static final String TARGET_LIB = "libfekit.so";
     private static final String BLOCK_PATH = "/proc/self/smaps";

@@ -1,4 +1,4 @@
-package com.cx.biliredirect;
+package io.github.memorimonita.biliminiredirect;
 
 import android.app.Activity;
 import android.content.SharedPreferences;
