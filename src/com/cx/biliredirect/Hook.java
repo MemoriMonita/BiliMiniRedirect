@@ -62,81 +62,46 @@ public class Hook implements IXposedHookLoadPackage {
     private static boolean sSkipDialog = true;
     private static boolean sLogAll = false;
 
-    /**
-     * 只在这些进程里 hook。
-     *
-     * QQ 的风控（TuringFD + minidetect.so）在主进程里扫 /proc/self/maps 找注入痕迹，
-     * 主进程一旦被注入就有被踢下线的风险。而小程序跳转发生在 :mini 系列进程，
-     * 主进程根本不需要 hook —— 所以这里按进程名白名单，主进程直接不注入。
-     *
-     * 微信同理：跳转发生在 :appbrand 系列进程。
-     */
-    private static final String[] QQ_PROC_SUFFIX = {":mini", ":mini1", ":mini2", ":mini3"};
-    private static final String[] WX_PROC_SUFFIX = {":appbrand", ":appbrand0", ":appbrand1", ":appbrand2"};
-
-    private static boolean shouldHookProcess(String pkg, String proc) {
-        if (proc == null) return false;
-        // 微信
-        if ("com.tencent.mm".equals(pkg)) {
-            for (String s : WX_PROC_SUFFIX) {
-                if (proc.endsWith(s)) return true;
-            }
-            return false;
-        }
-        // QQ 系：只 hook 小程序容器进程
-        for (String s : QQ_PROC_SUFFIX) {
-            if (proc.endsWith(s)) return true;
-        }
-        return false;
-    }
-
     @Override
     public void handleLoadPackage(LoadPackageParam lp) {
         if (!HOST_PKGS.contains(lp.packageName)) return;
 
-        if (!shouldHookProcess(lp.packageName, lp.processName)) {
-            // 主进程等：不 hook，避免被风控扫到
-            XposedBridge.log(TAG + ": 跳过 " + lp.packageName + " / " + lp.processName
-                    + "（非小程序进程，不注入 hook）");
-            // 自检：模块 APK 是否仍出现在本进程的 maps 里（LSPosed 加载模块就会留痕）
-            XposedBridge.log(TAG + ": [自检] " + lp.processName + " maps 里的模块痕迹 = "
-                    + selfTrace());
-            return;
-        }
-
+        // 所有进程都注入。
+        // QQ 的风控靠 libfekit.so 读 /proc/self/smaps 检测，那一路由本模块自带的
+        // native 部分（libstealth.so）在 GOT 层屏蔽（smaps 读取重定向到 /dev/null），
+        // 所以 Java 侧不必再做进程白名单缩限，全进程 hook 才能覆盖所有跳转路径。
         XposedBridge.log(TAG + ": 注入 " + lp.packageName + " / " + lp.processName);
 
+        hookStealthBootstrap(lp);
         hookJefsClass(lp);
         hook(lp, "android.app.Instrumentation", "execStartActivity", "Instrumentation");
         hook(lp, "android.content.ContextWrapper", "startActivity", "ContextWrapper");
         hook(lp, "android.app.ContextImpl", "startActivity", "ContextImpl");
     }
 
-    /** 读 /proc/self/maps，看有没有我们自己的包名 / LSPosed 痕迹。取证用。 */
-    private static String selfTrace() {
-        StringBuilder sb = new StringBuilder();
-        java.io.BufferedReader r = null;
+    /**
+     * 尽早拿到 Context 并启动 native 规避（加载 libstealth.so）。
+     * 挂在 Application#onCreate 后 —— 此时 libfekit.so 通常还没加载，
+     * native 侧再轮询等它出现。
+     */
+    private void hookStealthBootstrap(LoadPackageParam lp) {
         try {
-            r = new java.io.BufferedReader(new java.io.FileReader("/proc/self/maps"));
-            String line;
-            int n = 0;
-            while ((line = r.readLine()) != null) {
-                String low = line.toLowerCase();
-                if (low.contains("biliredirect")) {
-                    sb.append("[模块APK]");
-                    n++;
-                } else if (low.contains("lspd") || low.contains("lsposed")) {
-                    sb.append("[LSPosed]");
-                    n++;
-                }
-                if (n > 6) break;
-            }
+            XposedHelpers.findAndHookMethod("android.app.Application", lp.classLoader, "onCreate",
+                    new XC_MethodHook() {
+                        @Override
+                        protected void afterHookedMethod(MethodHookParam param) {
+                            try {
+                                if (param.thisObject instanceof Context) {
+                                    Stealth.ensureStarted((Context) param.thisObject);
+                                }
+                            } catch (Throwable t) {
+                                XposedBridge.log(TAG + ": Stealth 启动失败 " + t);
+                            }
+                        }
+                    });
         } catch (Throwable t) {
-            return "读取失败 " + t;
-        } finally {
-            if (r != null) try { r.close(); } catch (Throwable ignored) {}
+            XposedBridge.log(TAG + ": hook Application#onCreate 失败 " + t);
         }
-        return sb.length() == 0 ? "无（干净）" : sb.toString();
     }
 
     private void hook(LoadPackageParam lp, String cls, String method, String label) {

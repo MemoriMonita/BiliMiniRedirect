@@ -8,6 +8,7 @@
 
     <application
         android:allowBackup="false"
+        android:extractNativeLibs="true"
         android:icon="@drawable/ic_launcher"
         android:label="Bili小程序重定向"
         android:theme="@android:style/Theme.DeviceDefault.DayNight">
@@ -27,5 +28,7 @@
             android:value="把 QQ/微信小程序里「打开哔哩哔哩」的跳转改到第三方客户端（默认 PiliPlus）" />
         <meta-data android:name="xposedminversion" android:value="93" />
         <meta-data android:name="xposedsharedprefs" android:value="true" />
+        <!-- 声明作用域：只 hook 系统框架，不碰 QQ/微信 -->
+        <meta-data android:name="xposedscope" android:resource="@array/xposed_scope" />
     </application>
 </manifest>

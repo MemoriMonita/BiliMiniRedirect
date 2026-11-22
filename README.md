@@ -6,25 +6,36 @@
 
 ---
 
-## 为什么得写模块
+## 装了什么
 
-QQ 小程序点「打开APP」时，走的是**包名定向**的 Intent，不是 scheme 解析：
+**一个 APK 就够**，不用刷 Magisk 模块。
 
-| 路径 | 实际行为 |
+它同时做两件事：
+
+| 层 | 做什么 |
 |---|---|
-| `AppJsPlugin.startApp` 带 path | `new ComponentName(packagename, path)` + `setComponent()` |
-| `AppJsPlugin.startApp` 不带 path | `getLaunchIntentForPackage(pkg)`（带 `setPackage`） |
-| `openScheme` | 起 QQ 自己的 `AppBrandLaunchUI` 中转，再自己 startActivity |
-
-Intent 里已经写死了包名，系统根本不会去 resolve 候选者。所以「把 PiliPlus 设为 bilibili.com 的默认应用」「`pm set-app-links`」这类办法**在架构上没有介入点**。
-
-那个「即将离开QQ」弹窗也是 QQ 进程内的 `QQCustomDialog`（`JefsClass#setupDialog`，埋点页名 `pg_bas_jump_out_qq_window`），不是系统弹窗。
-
-只能在宿主进程内 hook。
+| **Java（Xposed）** | 拦截 `JefsClass`，把「打开哔哩哔哩」改成打开 PiliPlus |
+| **Native（内嵌 .so）** | 屏蔽 QQ 风控库读 `/proc/self/smaps`，避免被检测踢下线 |
 
 ---
 
-## 怎么做的
+## 为什么光有 Java hook 不够
+
+QQ 小程序点「打开APP」走的是**包名定向** Intent，系统层的默认应用设置根本没有介入点，只能在宿主进程内 hook。这部分由 Xposed 完成。
+
+但只做这个会被 QQ **踢下线**（实测错误码 `ACCOUNT_KICKED`、`ACCOUNT_EXPIRED (w21)`，`isSameDevice=false`）。
+
+根因藏在 native 层：QQ 的风控库 **`libfekit.so`（7.6 MB）会 `fopen("/proc/self/smaps")` 读取进程内存映射**，扫里面的注入痕迹（LSPosed 的 so、模块路径）上报服务端。
+
+**LSPosed 的 Java hook 拦不住 native 的 `fopen`** —— 这就是为什么之前试过「主进程不 hook」「只在小程序进程 hook」「改 hook 到 system_server」全部无效。
+
+解法来自 [TCQT](https://github.com/callng/TCQT)：在 native 层把 `libfekit.so` 对 `/proc/self/smaps` 的读取重定向到 `/dev/null`。
+
+---
+
+## 实现
+
+### Java 层：拦截跳转
 
 QQ 的跳转链路（从 QQ 的 `classes.dex` 反编译确认）：
 
@@ -32,74 +43,100 @@ QQ 的跳转链路（从 QQ 的 `classes.dex` 反编译确认）：
 JefsClass.startActivity(Context,Intent)        [PUBLIC STATIC]
   └→ checkAndDoSync(Context,Intent,Runnable)   [PUBLIC]
        └→ checkAndDoAsyn(...)                  [PUBLIC]
-            └→ intercept(Context,Intent,CancelableRunnable,Interceptor)  [PRIVATE]
+            └→ intercept(...)                  [PRIVATE]
 ```
 
 hook 点选公开的 `startActivity` / `checkAndDoSync`（签名稳定），不碰 private 的 `intercept`：
 
 1. `JefsClass#startActivity(Context, Intent)` 和 `(Context, Intent, Bundle)` —— 静态入口
 2. `JefsClass#checkAndDoSync(Context, Intent, Runnable)` —— 实例入口
-3. `android.app.Instrumentation#execStartActivity` —— 所有 Activity 启动的收口，兜住绕过 JefsClass 的路径
+3. `android.app.Instrumentation#execStartActivity` —— 所有 Activity 启动的收口
 4. `ContextWrapper` / `ContextImpl#startActivity` —— 直接调 Context 的那批
 
-命中后自己 `ctx.startActivity(重定向后的 Intent)` 并 `setResult(null)` 掐掉原流程，连「即将离开QQ」弹窗一起跳过。
+命中后自己 `ctx.startActivity(重定向后的 Intent)` 再 `setResult(null)` 掐掉原流程，连「即将离开QQ」弹窗一起跳过。
 
 > 为什么不能只改 `param.args` 里的 Intent：原流程那个 `Runnable` 是调用方构造的闭包，
-> 里面捕获的是旧 Intent 的引用，改参数对它无效。所以必须自己发起跳转 + 掐掉原流程。
+> 里面捕获的是旧 Intent 的引用，改参数对它无效。
 
-重定向时保留原始 `data` URI，所以能直达对应视频（PiliPlus 的 Manifest 声明了 `bilibili://video`、`bilibili://bangumi/season*`、`https://*.bilibili.com` 等）。
+重定向时保留原始 `data` URI，所以能直达对应视频。
 
-### 只在小程序进程里 hook（重要）
+### Native 层：屏蔽 smaps 读取
 
-QQ 的风控（腾讯 TuringFD + `minidetect.so`）在**主进程**里扫 `/proc/self/maps`、`/proc/self/status`、`/proc/self/mountinfo` 找注入痕迹，主进程被注入就有被踢下线的风险。
+`libstealth.so` 随 APK 打包，模块在 `Application#onCreate` 后 `System.load()` 加载，然后：
 
-而小程序跳转发生在 `:mini` 系列进程，主进程根本不需要 hook。所以模块按**进程名白名单**决定是否注入：
+1. 轮询 `dl_iterate_phdr` 等 `libfekit.so` 加载（它通常要 0.5~1.5 秒）
+2. 解析它的 `PT_DYNAMIC` → `DT_STRTAB` / `DT_SYMTAB` / `DT_JMPREL`
+3. 遍历 `.rela.plt`，找符号名为 `fopen` 的 `R_AARCH64_JUMP_SLOT`
+4. `mprotect` 让 GOT 页可写，原子替换成自己的 `stealth_fopen`，原地址存起来
+5. `stealth_fopen` 遇到 `/proc/self/smaps` 就返回 `/dev/null` 的句柄，其他路径原样转发
 
-| 进程 | 是否 hook |
-|---|---|
-| `com.tencent.mobileqq`（主进程） | ❌ 只打日志，不挂任何 hook |
-| `:MSF` / `:tool` / `:qzone` / `:peak` / `:privileged_process1` / `:gameservice` | ❌ 同上 |
-| `:mini` / `:mini1` / `:mini2` / `:mini3` | ✅ 注入 |
-| `com.tencent.mm:appbrand*`（微信小程序） | ✅ 注入 |
+只改 `libfekit.so` 自己那张 GOT，**不影响全局 `fopen`**。
 
-实测主进程的 `/proc/self/maps` 里**看不到模块 APK 路径**（LSPosed 是内存加载 dex，不是 mmap 文件），所以 TuringFD 的 maps 扫描扫不到。
-
-> ⚠ LSPosed 的作用域是**按应用**勾选的，没有「按进程排除」功能。
-> 所以 QQ 的作用域**必须保持勾选**，靠模块自己的进程白名单来避免污染主进程。
-> 如果取消勾选 QQ，模块根本不会被加载，功能直接失效。
-
-### 实测
-
-小米 25060RK16C / HyperOS 3.0 / Android 16，QQ 小程序里点视频，LSPosed 日志：
-
-```
-# 主进程：只跳过，不 hook
-(com.tencent.mobileqq)      BiliRedirect: 跳过 com.tencent.mobileqq（非小程序进程，不注入 hook）
-(com.tencent.mobileqq)      BiliRedirect: [自检] maps 里的模块痕迹 = 无（干净）
-
-# 小程序进程：正常注入
-(com.tencent.mobileqq:mini) BiliRedirect: 注入 ... hook JefsClass#checkAndDoSync(3 参) OK
-
-# 拦截生效
-(com.tencent.mobileqq:mini) BiliRedirect [Jefs.checkAndDoSync]
-  pkg=tv.danmaku.bili  data=bilibili://video/BV1iSYs6SE4G?page=0&bsource=xcx&...
-  =>  pkg=com.example.piliplus  comp=com.example.piliplus/.MainActivity
-      data=bilibili://video/BV1iSYs6SE4G?page=0&bsource=xcx&...
-```
-
-PiliPlus 直接在前台打开，没有弹「即将离开QQ」确认框，BV 号与全部参数原样保留。
+> 为什么不直接用 Zygisk 自带的 `pltHookRegister`：实测在 ZygiskNext 上
+> `pltHookCommit` 一直返回 false（库已加载、dev/inode 也对）。TCQT 自己实现
+> PLT hook 也是同样原因。
 
 ---
 
 ## 安装
 
-1. 装 `BiliMiniRedirect.apk`（[Releases](../../releases) 页有）
-2. LSPosed 管理器 → 模块 → 启用「B站跳转重定向」
+1. 装 `BiliMiniRedirect.apk`
+2. LSPosed 管理器 → 模块 → 启用「Bili小程序重定向」
 3. **作用域勾选**：
-   - `QQ`（`com.tencent.mobileqq`）—— 必须，LSPosed 勾应用即覆盖 `:mini` 等子进程
-   - `微信`（`com.tencent.mm`）—— 可选，微信里跳 B 站同理
-4. 强制停止 QQ（设置 → 应用 → QQ → 强制停止），或重启手机
+   - `QQ`（`com.tencent.mobileqq`）—— 必须
+   - `微信`（`com.tencent.mm`）—— 可选
+   - ❌ 不要勾「系统框架」
+4. 强制停止 QQ（设置 → 应用 → QQ → 强制停止）
 5. 打开模块 App，确认「目标应用包名」= `com.example.piliplus`，保存
+
+---
+
+## 验证
+
+装好后强制停止 QQ 再打开，看日志：
+
+```bash
+adb logcat -s BiliStealth BiliRedirect
+```
+
+**期望看到：**
+
+```
+# native 规避生效
+BiliStealth: nativeStart: lib=libfekit.so block=/proc/self/smaps
+BiliStealth: PLT hook installed for libfekit.so (poll #33)
+BiliStealth: intercept fopen(/proc/self/smaps) -> /dev/null (count=1)
+
+# Java 跳转生效
+BiliRedirect: 注入 com.tencent.mobileqq / com.tencent.mobileqq:mini
+BiliRedirect [Jefs.checkAndDoSync] pkg=tv.danmaku.bili ...  =>  pkg=com.example.piliplus ...
+```
+
+`intercept fopen(...)` 这行是关键 —— 说明真的拦到了风控库的读取。
+
+---
+
+## 备选：分离版（Zygisk 模块）
+
+如果合并版的 native 部分在你的设备上加载不了（`System.load` 失败、或 `libstealth.so` 没被解压），
+可以用分离版：`BiliStealth-zygisk-v1.0.zip` 是独立的 Zygisk 模块，功能相同。
+
+1. KernelSU / Magisk → 模块 → 从本地安装 → 选这个 zip
+2. 完整重启
+3. 装 `BiliMiniRedirect.apk`（此时它的 native 部分会因 `libstealth.so` 已存在而跳过或重复，建议先确认）
+
+源码在 [`stealth-zygisk/`](stealth-zygisk/)。
+
+**这个版本实测通过的证据**（小米 25060RK16C / HyperOS 3.0 / Android 16）：
+
+```
+BiliStealth: preAppSpecialize: target process com.tencent.mobileqq:MSF
+BiliStealth: PLT hook installed for libfekit.so (poll #30)
+BiliStealth: PLT hook installed for libfekit.so (poll #33)
+BiliStealth: PLT hook installed for libfekit.so (poll #27)
+BiliStealth: PLT hook installed for libfekit.so (poll #23)
+BiliStealth: intercept fopen(/proc/self/smaps) -> /dev/null (count=1)
+```
 
 ---
 
@@ -115,41 +152,23 @@ PiliPlus 直接在前台打开，没有弹「即将离开QQ」确认框，BV 号
 
 ---
 
-## 排查
-
-打开「日志取证」，复现一次跳转，去 **LSPosed 管理器 → 日志** 看 `BiliRedirect` 标签：
-
-```
-BiliRedirect: 跳过 com.tencent.mobileqq / com.tencent.mobileqq（非小程序进程，不注入 hook）
-BiliRedirect: [自检] com.tencent.mobileqq maps 里的模块痕迹 = 无（干净）
-BiliRedirect: 注入 com.tencent.mobileqq / com.tencent.mobileqq:mini
-BiliRedirect: hook JefsClass#startActivity(2 参) OK
-BiliRedirect: hook JefsClass#checkAndDoSync(3 参) OK
-BiliRedirect [Jefs.checkAndDoSync] pkg=tv.danmaku.bili ...  =>  pkg=com.example.piliplus ...
-```
-
-- **一条都没有** → 作用域没勾上（QQ 必须勾），或 QQ 没重启
-- **只有「跳过」没有「注入」** → 正常，说明你还没打开小程序；`:mini` 进程要打开小程序才会创建
-- **只有「全部」没有「=>」** → `shouldRedirect` 没命中，把日志发 issue
-- **有「=>」但没跳过去** → 看有没有 `自行跳转失败`
-
----
-
 ## 已知限制
 
 - QQ 版本更新后 `JefsClass` 可能改名/改签名 → 日志会打「JefsClass 里没找到可 hook 的方法，退回通用 hook」，此时靠第 3/4 层兜底（但会保留 QQ 的确认弹窗）
+- 只屏蔽 `/proc/self/smaps`。如果 QQ 改读别的文件做检测（`/proc/self/maps`、`/proc/self/status`），需要在 `stealth_jni.cpp` 的 block 列表里补
+- 如果 QQ 把风控挪到别的 so（不走 `libfekit.so` 的 `fopen`），这套方案会失效
 - HyperOS 的「链式启动管理」（`com.miui.securitycenter`）可能在系统层再弹一次确认，本模块不处理
 - 只接管 B 站系包名：`tv.danmaku.bili` / `tv.danmaku.bilibilihd` / `com.bilibili.app.in` / `com.bilibili.bilithings` / `com.bilibili.app.blue`
-- **主进程仍会被 LSPosed 加载模块**（只是不挂 hook）。maps 里看不到痕迹，但 LSPosed 注入本身在 ART 层有残留，理论上仍可能被更强的检测发现。如果还是被踢，需要改成 hook `system_server`（`ActivityStarter.executeRequest`），让 QQ 进程一个模块都不注入
 
 ---
 
 ## 自己构建
 
-不依赖 Gradle / Android Studio，只用 `aapt2` + `javac` + `d8` + `zipalign` + `apksigner`。
+不依赖 Gradle / Android Studio，用 `aapt2` + `javac` + `d8` + `apksigner`，native 部分用 NDK 的 clang。
 
 ```bash
 ANDROID_SDK=~/Android/Sdk \
+ANDROID_NDK=~/Android/Sdk/ndk/27.2.12479018 \
 XPOSED_API=~/libs/api-82.jar \
 JAVA_HOME=/path/to/jdk17 \
 bash build.sh
@@ -157,21 +176,22 @@ bash build.sh
 
 需要：
 - Android SDK，含 `build-tools/36.0.0/` 与 `platforms/android-36/android.jar`
+- Android NDK r27（编译 `libstealth.so`）
 - [Xposed API 82](https://api.xposed.info/)（`api-82.jar`）
 - JDK 17+
 
-签名密钥默认读 `keystore.jks`（不存在会自动生成），可用 `KEYSTORE` / `KEYSTORE_PASS` / `KEYSTORE_ALIAS` 覆盖。
-
-> Windows 上火绒 HIPS 会拦截 `aapt2.exe` / `zipalign.exe` 写文件（报「数据无效 (13)」），
-> `build.sh` 里已把它们拷成 `_bt_aapt.exe` / `_bt_align.exe` 规避。
+> Windows 上火绒 HIPS 会拦截 `aapt2.exe` / `zipalign.exe` / `ld.lld.exe` 在工程目录写文件
+> （报「数据无效」或「Permission denied」）。`build.sh` 里已把它们改名成 `_bt_aapt.exe`
+> 等副本，并把 native 产物先链接到临时目录再拷回来规避。
 
 ---
 
 ## 相关项目
 
-- [PiliPlus](https://github.com/bggRGjQaUbCoE/PiliPlus) —— 第三方 B 站客户端，本模块默认目标、也是实测用的那个。感谢作者。
+- [TCQT](https://github.com/callng/TCQT) —— 本项目的 native 规避思路直接来自它（`libfekit.so` 的 `fopen` 劫持），PLT hook 结构也参考了它的实现。感谢作者。
+- [PiliPlus](https://github.com/bggRGjQaUbCoE/PiliPlus) —— 第三方 B 站客户端，默认目标、也是实测用的那个。
 - [LSPosed](https://github.com/LSPosed/LSPosed) —— 模块框架。
-- [QAuxiliary](https://github.com/cinit/QAuxiliary) —— 它的 `JumpController` 是 hook `JefsClass` 的早期实践，本模块的 hook 点选择参考了它。
+- [QAuxiliary](https://github.com/cinit/QAuxiliary) —— 它的 `JumpController` 是 hook `JefsClass` 的早期实践，hook 点选择参考了它。
 
 ---
 
