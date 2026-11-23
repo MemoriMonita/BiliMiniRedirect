@@ -1,0 +1,7 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- 只声明系统框架（android）。LSPosed 打开模块详情时会自动推荐这一项。 -->
+    <string-array name="xposed_scope">
+        <item>android</item>
+    </string-array>
+</resources>

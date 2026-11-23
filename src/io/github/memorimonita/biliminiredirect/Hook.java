@@ -64,6 +64,12 @@ public class Hook implements IXposedHookLoadPackage {
 
     @Override
     public void handleLoadPackage(LoadPackageParam lp) {
+        // 系统框架模式：作用域只勾「系统框架」时走这一路，QQ 进程零注入。
+        if ("android".equals(lp.packageName)) {
+            SysHook.install(lp);
+            return;
+        }
+
         if (!HOST_PKGS.contains(lp.packageName)) return;
 
         // 所有进程都注入。

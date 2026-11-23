@@ -22,3 +22,7 @@ Thumbs.db
 
 # Zygisk 模块产物（走 Release 分发）
 BiliStealth-zygisk-*.zip
+
+# 探针/调研的构建产物与第三方资料副本（不随仓库分发）
+build-probe/
+_refs/

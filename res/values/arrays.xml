@@ -1,8 +1,7 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
-    <!-- 默认作用域：QQ 与微信（可再加 TIM 等） -->
+    <!-- 作用域：只勾「系统框架」，QQ/微信 一个进程都不注入 -->
     <string-array name="xposed_scope">
-        <item>com.tencent.mobileqq</item>
-        <item>com.tencent.mm</item>
+        <item>android</item>
     </string-array>
 </resources>

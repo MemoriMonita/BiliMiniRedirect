@@ -99,16 +99,14 @@ public class MainActivity extends Activity {
         root.addView(save);
 
         TextView scope = new TextView(this);
-        scope.setText("\n⚠ 必须配合 BiliStealth 一起用\n\n"
-                + "QQ 的风控库 libfekit.so 会读 /proc/self/smaps 检测注入，\n"
-                + "本模块的 Java hook 拦不住它，所以必须刷配套的 Zygisk 模块\n"
-                + "「BiliStealth」在 native 层把那一路读取屏蔽掉。\n\n"
-                + "LSPosed 作用域：\n"
-                + "• ✅ 勾 QQ（com.tencent.mobileqq）\n"
-                + "• ✅ 勾微信（com.tencent.mm，可选）\n"
-                + "• ❌ 不要勾「系统框架」\n\n"
-                + "排查用：打开「日志取证」后，在 LSPosed 管理器 → 日志 里\n"
-                + "能看到每次跳转的 Intent；BiliStealth 的日志 tag 是 BiliStealth。");
+        scope.setText("\n作用域（2.0 起改成系统框架模式）：\n"
+                + "• ✅ 只勾「系统框架」\n"
+                + "• ❌ 不要勾 QQ / 微信\n\n"
+                + "原理：在 system_server 解析 Intent 的阶段把目标包名从官方 B 站\n"
+                + "改成第三方客户端，QQ 进程里没有任何注入，libfekit.so 扫不到痕迹。\n"
+                + "改完作用域必须重启手机才生效。\n\n"
+                + "排查：LSPosed 管理器 → 日志 搜 BiliRedirect，\n"
+                + "正常会出现「[sys] ... (原目标 tv.danmaku.bili → com.example.piliplus)」。");
         scope.setTextSize(12);
         scope.setTextColor(Color.GRAY);
         scope.setPadding(0, dp(16), 0, 0);
